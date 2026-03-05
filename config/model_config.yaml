@@ -1,0 +1,23 @@
+# Model Configuration — Multi-Modal Liveness Detection
+
+visual:
+  backbone: "resnet18"      # resnet18, efficientnet_b0
+  pretrained: true
+  input_size: [224, 224]
+  embedding_dim: 512
+
+audio:
+  backbone: "lcnn"         # lcnn, resnet, aasist
+  input_channels: 1
+  embedding_dim: 512
+
+fusion:
+  method: "concat"         # concat, attention, late
+  hidden_dim: 256
+  dropout: 0.3
+
+training:
+  batch_size: 32
+  epochs: 50
+  lr: 1e-4
+  weight_decay: 1e-5

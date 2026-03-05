@@ -1,0 +1,45 @@
+# Data Configuration — Multi-Modal Liveness Detection
+# 200 samples from each Kaggle dataset
+
+sampling:
+  n_per_dataset: 200   # Samples from each dataset
+  seed: 42             # Reproducibility
+
+paths:
+  raw:
+    ff_c23: "data/raw/ff_c23"
+    deepfake_detection: "data/raw/deepfake_detection"
+    asvspoof2019: "data/raw/asvspoof2019"
+  processed: "data/processed"
+  sampling_indices: "data/sampling"
+
+# FF-c23: https://www.kaggle.com/datasets/xdxd003/ff-c23
+ff_c23:
+  compression: "c23"
+  categories:
+    - original
+    - deepfakes
+    - face2face
+    - faceswap
+    - neural_textures
+  frame_extraction:
+    num_frames: 8
+    face_size: 224
+
+# Deepfake Detection Challenge: https://www.kaggle.com/competitions/deepfake-detection-challenge/data
+deepfake_detection:
+  frame_extraction:
+    num_frames: 8
+    face_size: 224
+
+# ASVspoof 2019: https://www.kaggle.com/datasets/awsaf49/asvpoof-2019-dataset
+asvspoof2019:
+  scenario: "logical_access"
+  categories:
+    - bona_fide
+    - spoofed
+  audio:
+    sample_rate: 16000
+    feature: "lfcc"
+    n_fft: 512
+    n_mels: 80

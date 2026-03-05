@@ -1,0 +1,31 @@
+# Multi-Modal Liveness Detection — Dependencies
+
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# Data & preprocessing
+opencv-python>=4.8.0
+librosa>=0.10.0
+scikit-learn>=1.3.0
+albumentations>=1.3.0
+
+# Data download
+kaggle>=1.5.0
+
+# Config & experiment tracking
+pyyaml>=6.0
+hydra-core>=1.3.0
+wandb>=0.15.0
+
+# Evaluation
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Dev
+pytest>=7.4.0
+black>=23.0.0
