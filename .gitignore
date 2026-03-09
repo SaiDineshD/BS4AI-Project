@@ -1,0 +1,48 @@
+# Data files
+data/FaceForensics++_C23/original/
+data/FaceForensics++_C23/Deepfakes/
+data/FaceForensics++_C23/Face2Face/
+data/FaceForensics++_C23/FaceSwap/
+data/FaceForensics++_C23/FaceShifter/
+data/FaceForensics++_C23/NeuralTextures/
+data/FaceForensics++_C23/DeepFakeDetection/
+data/LA/
+data/processed/
+data/sampling/
+data/raw/
+
+# Outputs
+outputs/
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Kaggle
+.kaggle/

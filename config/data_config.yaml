@@ -1,45 +1,47 @@
 # Data Configuration — Multi-Modal Liveness Detection
-# 200 samples from each Kaggle dataset
+# 200 samples from each dataset
 
 sampling:
-  n_per_dataset: 200   # Samples from each dataset
-  seed: 42             # Reproducibility
+  n_per_dataset: 200
+  seed: 42
 
 paths:
-  raw:
-    ff_c23: "data/raw/ff_c23"
-    deepfake_detection: "data/raw/deepfake_detection"
-    asvspoof2019: "data/raw/asvspoof2019"
+  ff_c23: "data/FaceForensics++_C23"
+  asvspoof2019: "data/LA/LA"
   processed: "data/processed"
   sampling_indices: "data/sampling"
 
-# FF-c23: https://www.kaggle.com/datasets/xdxd003/ff-c23
 ff_c23:
   compression: "c23"
   categories:
-    - original
-    - deepfakes
-    - face2face
-    - faceswap
-    - neural_textures
+    real:
+      - original
+    fake:
+      - Deepfakes
+      - Face2Face
+      - FaceSwap
+      - NeuralTextures
+      - FaceShifter
+  csv_dir: "data/FaceForensics++_C23/csv"
   frame_extraction:
     num_frames: 8
     face_size: 224
 
-# Deepfake Detection Challenge: https://www.kaggle.com/competitions/deepfake-detection-challenge/data
-deepfake_detection:
-  frame_extraction:
-    num_frames: 8
-    face_size: 224
-
-# ASVspoof 2019: https://www.kaggle.com/datasets/awsaf49/asvpoof-2019-dataset
 asvspoof2019:
   scenario: "logical_access"
-  categories:
-    - bona_fide
-    - spoofed
+  splits:
+    train:
+      audio_dir: "ASVspoof2019_LA_train/flac"
+      protocol: "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt"
+    dev:
+      audio_dir: "ASVspoof2019_LA_dev/flac"
+      protocol: "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt"
+    eval:
+      audio_dir: "ASVspoof2019_LA_eval/flac"
+      protocol: "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt"
   audio:
     sample_rate: 16000
     feature: "lfcc"
     n_fft: 512
-    n_mels: 80
+    n_lfcc: 60
+    max_length: 64000  # 4 seconds at 16kHz
