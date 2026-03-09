@@ -70,4 +70,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for collaboration guidelines.
 
 ## License
 
-[Specify license, e.g., MIT]
