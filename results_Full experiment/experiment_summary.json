@@ -1,0 +1,33 @@
+{
+  "experiment": {
+    "device": "cpu",
+    "n_samples": 100,
+    "visual_epochs": 12,
+    "audio_epochs": 15,
+    "total_time_seconds": 179.4,
+    "audio_time_seconds": 68.6,
+    "visual_time_seconds": 109.0
+  },
+  "audio_test_metrics": {
+    "eer": 0.16,
+    "eer_threshold": 0.133182,
+    "min_tdcf": 0.29484,
+    "accuracy": 0.84,
+    "auc": 0.9176
+  },
+  "visual_test_metrics": {
+    "eer": 0.636364,
+    "eer_threshold": 0.883543,
+    "min_tdcf": 0.727273,
+    "accuracy": 0.4,
+    "auc": 0.409091
+  },
+  "fusion_test_metrics": {
+    "eer": 0.5,
+    "eer_threshold": 0.276815,
+    "min_tdcf": 0.818182,
+    "accuracy": 0.533333,
+    "auc": 0.5
+  },
+  "fusion_best_weight": 0.0
+}

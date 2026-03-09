@@ -1,0 +1,41 @@
+{
+  "experiment": {
+    "device": "cpu",
+    "n_samples": 200,
+    "visual_epochs": 20,
+    "audio_epochs": 20,
+    "fusion_epochs": 30,
+    "total_time": 546.7,
+    "improvements": [
+      "augmentation",
+      "frozen_layers",
+      "face_detection",
+      "attention_fusion",
+      "label_smoothing",
+      "cosine_lr",
+      "balanced_sampling",
+      "200_samples"
+    ]
+  },
+  "audio_test_metrics": {
+    "eer": 0.13,
+    "eer_threshold": 0.787528,
+    "min_tdcf": 0.281613,
+    "accuracy": 0.87,
+    "auc": 0.9338
+  },
+  "visual_test_metrics": {
+    "eer": 0.444444,
+    "eer_threshold": 0.970872,
+    "min_tdcf": 0.63327,
+    "accuracy": 0.55,
+    "auc": 0.661616
+  },
+  "fusion_test_metrics": {
+    "eer": 0.37931,
+    "eer_threshold": 0.885473,
+    "min_tdcf": 0.865285,
+    "accuracy": 0.631579,
+    "auc": 0.640805
+  }
+}
