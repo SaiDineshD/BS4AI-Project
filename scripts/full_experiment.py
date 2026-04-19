@@ -6,6 +6,7 @@ optional MediaPipe face crops, optional K-fold visual evaluation, CLI overrides.
 
 import argparse
 import json
+import os
 import sys
 import time
 import warnings
@@ -56,6 +57,11 @@ VISUAL_EPOCHS = 20
 AUDIO_EPOCHS = 20
 FUSION_EPOCHS = 30
 BATCH_SIZE = 8
+NUM_WORKERS = 0
+FUSION_BATCH = 16
+# Used when --preset colab or COLAB_RELEASE_TAG is set (unless CLI overrides).
+COLAB_DEFAULT_BATCH = 32
+COLAB_DEFAULT_NUM_WORKERS = 6
 LR = 3e-4
 LABEL_SMOOTHING = 0.1
 VISUAL_BACKBONE = "resnet18"
@@ -78,11 +84,45 @@ plt.rcParams.update({
 sns.set_theme(style="whitegrid", palette="muted")
 
 
+def _loader_kw() -> dict:
+    """DataLoader options for throughput: workers + prefetch (Colab/Linux) and pin_memory (CUDA)."""
+    kw: dict = {"num_workers": int(NUM_WORKERS)}
+    if NUM_WORKERS > 0:
+        kw["persistent_workers"] = True
+        kw["prefetch_factor"] = max(2, min(8, NUM_WORKERS))
+    if DEVICE.type == "cuda":
+        kw["pin_memory"] = True
+    return kw
+
+
 def _num_frames_for_run() -> int:
     data_cfg = load_data_config()
     return NUM_FRAMES if NUM_FRAMES is not None else int(
         data_cfg["ff_c23"]["frame_extraction"]["num_frames"]
     )
+
+
+def _apply_colab_loader_defaults(args: argparse.Namespace, preset: str) -> None:
+    """Raise batch/workers on Colab when preset is colab or COLAB_RELEASE_TAG is set."""
+    global BATCH_SIZE, NUM_WORKERS, FUSION_BATCH
+
+    bs = args.batch_size if args.batch_size is not None else BATCH_SIZE
+    nw = args.num_workers if args.num_workers is not None else NUM_WORKERS
+    fb = args.fusion_batch_size if args.fusion_batch_size is not None else FUSION_BATCH
+
+    on_colab_vm = bool(os.environ.get("COLAB_RELEASE_TAG"))
+    use_colab = preset == "colab" or on_colab_vm
+    if use_colab:
+        if args.batch_size is None:
+            bs = COLAB_DEFAULT_BATCH
+        if args.num_workers is None:
+            nw = COLAB_DEFAULT_NUM_WORKERS
+        if args.fusion_batch_size is None:
+            fb = bs
+
+    BATCH_SIZE = max(1, int(bs))
+    NUM_WORKERS = max(0, int(nw))
+    FUSION_BATCH = max(1, int(fb))
 
 
 # ── AUDIO ────────────────────────────────────────────────────────────────────
@@ -122,10 +162,10 @@ def train_audio_model():
     print(f"  Train: {len(train_ds)} | Dev: {len(dev_ds)} | Eval: {len(eval_ds)}")
 
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, **_loader_kw()
     )
-    val_loader = DataLoader(dev_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    test_loader = DataLoader(eval_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    val_loader = DataLoader(dev_ds, batch_size=BATCH_SIZE, shuffle=False, **_loader_kw())
+    test_loader = DataLoader(eval_ds, batch_size=BATCH_SIZE, shuffle=False, **_loader_kw())
 
     model = AudioBackbone(embedding_dim=512)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
@@ -213,10 +253,10 @@ def train_visual_model():
     print(f"  Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, **_loader_kw()
     )
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, **_loader_kw())
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, **_loader_kw())
 
     freeze_vis = 5 if VISUAL_BACKBONE == "efficientnet_b0" else 6
     model = build_visual_backbone(
@@ -435,8 +475,8 @@ def train_fusion_model(visual_results, audio_results):
             include_audio=True,
             audio_cfg=acfg,
         )
-        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, num_workers=0)
-        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, **_loader_kw())
+        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, **_loader_kw())
         print("  Extracting paired visual + audio embeddings (FaceForensics++ clips)...")
         train_v_emb, train_a_emb, train_labels = extract_paired_av_embeddings(
             visual_model, audio_model, v_train_loader
@@ -469,8 +509,8 @@ def train_fusion_model(visual_results, audio_results):
             face_detector=FACE_DETECTOR,
         )
 
-        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, num_workers=0)
-        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, **_loader_kw())
+        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, **_loader_kw())
 
         v_train_emb, v_train_lbl = extract_embeddings(visual_model, v_train_loader)
         v_test_emb, v_test_lbl = extract_embeddings(visual_model, v_test_loader)
@@ -493,8 +533,8 @@ def train_fusion_model(visual_results, audio_results):
             **ak,
         )
 
-        a_train_loader = DataLoader(a_train_ds, batch_size=BATCH_SIZE, num_workers=0)
-        a_test_loader = DataLoader(a_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+        a_train_loader = DataLoader(a_train_ds, batch_size=BATCH_SIZE, **_loader_kw())
+        a_test_loader = DataLoader(a_test_ds, batch_size=BATCH_SIZE, **_loader_kw())
 
         a_train_emb, a_train_lbl = extract_embeddings(audio_model, a_train_loader)
         a_test_emb, a_test_lbl = extract_embeddings(audio_model, a_test_loader)
@@ -518,9 +558,11 @@ def train_fusion_model(visual_results, audio_results):
         train_dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(42))
 
-    train_loader = DataLoader(train_sub, batch_size=16, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_sub, batch_size=16, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    train_loader = DataLoader(
+        train_sub, batch_size=FUSION_BATCH, shuffle=True, drop_last=True, **_loader_kw()
+    )
+    val_loader = DataLoader(val_sub, batch_size=FUSION_BATCH, shuffle=False, **_loader_kw())
+    test_loader = DataLoader(test_dataset, batch_size=FUSION_BATCH, shuffle=False, **_loader_kw())
 
     fcfg = mcfg.get("fusion", {})
     hidden_dim = int(fcfg.get("hidden_dim", 256))
@@ -1006,9 +1048,9 @@ def run_visual_kfold():
             face_detector=FACE_DETECTOR,
         )
         train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+            train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, **_loader_kw()
         )
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, **_loader_kw())
 
         freeze_vis = 5 if VISUAL_BACKBONE == "efficientnet_b0" else 6
         model = build_visual_backbone(
@@ -1074,16 +1116,38 @@ def parse_args():
     p.add_argument("--audio-epochs", type=int, default=None)
     p.add_argument("--fusion-epochs", type=int, default=None)
     p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=f"Audio/visual DataLoader batch (default {BATCH_SIZE}, or {COLAB_DEFAULT_BATCH} on Colab when "
+        "--preset colab or COLAB_RELEASE_TAG is set). Use --amp on CUDA; lower if OOM.",
+    )
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=f"DataLoader workers (default {NUM_WORKERS}, or {COLAB_DEFAULT_NUM_WORKERS} on Colab when "
+        "--preset colab or COLAB_RELEASE_TAG is set).",
+    )
+    p.add_argument(
+        "--fusion-batch-size",
+        type=int,
+        default=None,
+        help=f"Fusion DataLoader batch (default {FUSION_BATCH}, or same as batch-size on Colab when "
+        "--preset colab or COLAB_RELEASE_TAG is set).",
+    )
+    p.add_argument(
         "--amp",
         action="store_true",
         help="Enable CUDA automatic mixed precision (no-op on CPU)",
     )
     p.add_argument(
         "--preset",
-        choices=["none", "strong", "production"],
+        choices=["none", "strong", "production", "colab"],
         default="none",
         help="strong: full pool + MediaPipe + mild label smoothing + 12 frames if omitted; "
-        "production: same + 50 epochs/modality if epochs not set (long FF++ run; use GPU + --amp on CUDA)",
+        "production: same + 50 epochs/modality if epochs not set (long FF++ run; use GPU + --amp on CUDA); "
+        "colab: same as production + larger DataLoader defaults (also when COLAB_RELEASE_TAG is set)",
     )
     p.add_argument(
         "--label-smoothing",
@@ -1112,6 +1176,7 @@ def main():
     global VISUAL_BACKBONE, VISUAL_LABEL, FACE_DETECTOR, KFOLD, KFOLD_EPOCHS
     global VISUAL_EPOCHS, AUDIO_EPOCHS, FUSION_EPOCHS, MODEL_CONFIG_PATH, USE_AMP, LABEL_SMOOTHING
     global FUSION_METHOD, FUSION_CONTRASTIVE_WEIGHT, PAIRED_SOURCE
+    global BATCH_SIZE, NUM_WORKERS, FUSION_BATCH
 
     args = parse_args()
     num_frames_arg = args.num_frames
@@ -1153,7 +1218,7 @@ def main():
         LABEL_SMOOTHING = 0.05
         if num_frames_arg is None:
             NUM_FRAMES = 12
-    elif preset == "production":
+    elif preset in ("production", "colab"):
         N_SAMPLES = None
         FACE_DETECTOR = "mediapipe"
         LABEL_SMOOTHING = 0.05
@@ -1168,9 +1233,23 @@ def main():
     if args.label_smoothing is not None:
         LABEL_SMOOTHING = float(args.label_smoothing)
 
+    _apply_colab_loader_defaults(args, preset)
+
     print("=" * 70)
     print("  MULTI-MODAL LIVENESS DETECTION — EXPERIMENT v3")
     print(f"  Device: {DEVICE} | n_samples={N_SAMPLES or 'all'} | frames={_num_frames_for_run()}")
+    print(
+        f"  DataLoader: batch_size={BATCH_SIZE} | num_workers={NUM_WORKERS} | "
+        f"fusion_batch={FUSION_BATCH}"
+    )
+    _on_colab = bool(os.environ.get("COLAB_RELEASE_TAG"))
+    if (preset == "colab" or _on_colab) and (
+        args.batch_size is None or args.num_workers is None or args.fusion_batch_size is None
+    ):
+        print(
+            "  Colab throughput: applied defaults for unset --batch-size / --num-workers / "
+            "--fusion-batch-size (override any flag to replace)"
+        )
     print(
         f"  Visual: {VISUAL_BACKBONE} | face_detector={FACE_DETECTOR} | "
         f"label_smoothing={LABEL_SMOOTHING} | preset={preset} | fusion_pairing={PAIRED_SOURCE} | AMP={USE_AMP}"
@@ -1214,6 +1293,10 @@ def main():
     summary = {
         "experiment": {
             "device": str(DEVICE),
+            "batch_size": BATCH_SIZE,
+            "num_workers": NUM_WORKERS,
+            "fusion_batch_size": FUSION_BATCH,
+            "colab_release_tag": os.environ.get("COLAB_RELEASE_TAG"),
             "n_samples": N_SAMPLES,
             "num_frames": _num_frames_for_run(),
             "visual_backbone": VISUAL_BACKBONE,
