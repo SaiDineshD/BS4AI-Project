@@ -40,10 +40,10 @@ class PairedEmbeddingDataset(Dataset):
 
         # Create paired indices: match by label
         self.pairs = []
-        v_real = (visual_labels == 0).nonzero(as_tuple=True)[0]
-        v_fake = (visual_labels == 1).nonzero(as_tuple=True)[0]
-        a_real = (audio_labels == 0).nonzero(as_tuple=True)[0]
-        a_fake = (audio_labels == 1).nonzero(as_tuple=True)[0]
+        v_real = (self.v_labels == 0).nonzero(as_tuple=True)[0]
+        v_fake = (self.v_labels == 1).nonzero(as_tuple=True)[0]
+        a_real = (self.a_labels == 0).nonzero(as_tuple=True)[0]
+        a_fake = (self.a_labels == 1).nonzero(as_tuple=True)[0]
 
         n_genuine = min(len(v_real), len(a_real))
         for i in range(n_genuine):
@@ -126,9 +126,15 @@ def train_fusion(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     from src.models.audio_backbone import AudioBackbone
-    from src.models.visual_backbone import VisualBackbone
+    from src.models.visual_backbone import build_visual_backbone
 
-    visual_model = VisualBackbone(embedding_dim=model_config["visual"]["embedding_dim"])
+    vb = model_config.get("visual", {}).get("backbone", "resnet18")
+    visual_model = build_visual_backbone(
+        backbone=vb,
+        embedding_dim=model_config["visual"]["embedding_dim"],
+        pretrained=False,
+        freeze_layers=0,
+    )
     audio_model = AudioBackbone(embedding_dim=model_config["audio"]["embedding_dim"])
 
     v_ckpt = torch.load(visual_checkpoint, map_location=device, weights_only=False)
@@ -175,6 +181,7 @@ def train_fusion(
         weight_decay=model_config["training"]["weight_decay"],
     )
     criterion = nn.CrossEntropyLoss()
+    use_amp = model_config.get("training", {}).get("use_amp", False)
 
     trainer = Trainer(
         model=fusion_model,
@@ -185,6 +192,7 @@ def train_fusion(
         device=device,
         output_dir=output_dir,
         forward_fn=fusion_forward,
+        use_amp=use_amp,
     )
 
     return trainer.train(epochs=model_config["training"]["epochs"], patience=10)

@@ -1,18 +1,23 @@
 # Model Configuration — Multi-Modal Liveness Detection
 
 visual:
-  backbone: "resnet18"      # resnet18, efficientnet_b0
+  backbone: "resnet34"      # resnet18, resnet34, efficientnet_b0
   pretrained: true
+  freeze_layers: 6          # early blocks frozen; use ~5 for efficientnet_b0 in full_experiment
   input_size: [224, 224]
   embedding_dim: 512
 
 audio:
-  backbone: "lcnn"         # lcnn, resnet, aasist
+  backbone: "lcnn"         # lcnn (Light CNN; VGGVox-style extensions possible)
   input_channels: 1
   embedding_dim: 512
 
 fusion:
-  method: "concat"         # concat, attention, late
+  method: "contrastive"    # concat, attention, contrastive (distance + supervised contrastive term)
+  contrastive_weight: 0.3
+  # cross_dataset: FF++ visual emb + ASVspoof audio emb (+ synthetic mismatch pairs)
+  # ff_av: same FaceForensics++ file — face crops + soundtrack (time-aligned; needs ffmpeg)
+  paired_source: "ff_av"
   hidden_dim: 256
   dropout: 0.3
 
@@ -21,3 +26,4 @@ training:
   epochs: 50
   lr: 1e-4
   weight_decay: 1e-5
+  use_amp: false            # CUDA mixed precision; override with run_experiment --amp

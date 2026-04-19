@@ -1,15 +1,18 @@
 """
 Generic training loop for visual, audio, and fusion models.
 Handles train/validation, checkpointing, and metric logging.
+Optional automatic mixed precision (AMP) on CUDA.
 """
 
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 from src.evaluation.metrics import compute_all_metrics
@@ -29,12 +32,14 @@ class Trainer:
         output_dir: str = "outputs",
         scheduler: Optional[object] = None,
         forward_fn: Optional[Callable] = None,
+        use_amp: bool = False,
     ):
         """
         Args:
             forward_fn: custom forward function for multi-modal models.
-                        Signature: forward_fn(model, batch) -> (logits, labels)
+                        Signature: forward_fn(model, batch, device) -> (logits, labels)
                         If None, assumes batch = (inputs, labels) and logits = model(inputs).
+            use_amp: If True and device is CUDA, use autocast + GradScaler for training.
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -46,6 +51,8 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.scheduler = scheduler
         self.forward_fn = forward_fn
+        self._amp_enabled = bool(use_amp) and device.type == "cuda"
+        self.scaler = GradScaler(enabled=self._amp_enabled)
         self.history: Dict[str, list] = {
             "train_loss": [],
             "val_loss": [],
@@ -53,6 +60,11 @@ class Trainer:
             "val_accuracy": [],
             "val_auc": [],
         }
+
+    def _autocast_ctx(self):
+        if self._amp_enabled:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return nullcontext()
 
     def _default_forward(self, batch):
         inputs, labels = batch
@@ -67,17 +79,25 @@ class Trainer:
         n_batches = 0
 
         for batch in self.train_loader:
-            if self.forward_fn:
-                logits, labels = self.forward_fn(self.model, batch, self.device)
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with self._autocast_ctx():
+                if self.forward_fn:
+                    logits, labels = self.forward_fn(self.model, batch, self.device)
+                else:
+                    logits, labels = self._default_forward(batch)
+                loss = self.criterion(logits, labels)
+
+            if self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
-                logits, labels = self._default_forward(batch)
-
-            loss = self.criterion(logits, labels)
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
 
             total_loss += loss.item()
             n_batches += 1
@@ -93,16 +113,18 @@ class Trainer:
         n_batches = 0
 
         for batch in self.val_loader:
-            if self.forward_fn:
-                logits, labels = self.forward_fn(self.model, batch, self.device)
-            else:
-                logits, labels = self._default_forward(batch)
+            with self._autocast_ctx():
+                if self.forward_fn:
+                    logits, labels = self.forward_fn(self.model, batch, self.device)
+                else:
+                    logits, labels = self._default_forward(batch)
 
-            loss = self.criterion(logits, labels)
+                loss = self.criterion(logits, labels)
+
             total_loss += loss.item()
             n_batches += 1
 
-            probs = torch.softmax(logits, dim=1)[:, 1]
+            probs = torch.softmax(logits.float(), dim=1)[:, 1]
             all_scores.append(probs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
 
@@ -143,13 +165,15 @@ class Trainer:
             self.history["val_accuracy"].append(val_metrics["accuracy"])
             self.history["val_auc"].append(val_metrics["auc"])
 
+            flip_note = " [scores↔]" if val_metrics.get("scores_flipped") else ""
+            amp_note = " [AMP]" if self._amp_enabled else ""
             print(
                 f"Epoch {epoch:3d}/{epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Val Loss: {val_metrics['loss']:.4f} | "
                 f"EER: {val_metrics['eer']:.4f} | "
                 f"AUC: {val_metrics['auc']:.4f} | "
-                f"Acc: {val_metrics['accuracy']:.4f} | "
+                f"Acc: {val_metrics['accuracy']:.4f}{flip_note}{amp_note} | "
                 f"{elapsed:.1f}s"
             )
 

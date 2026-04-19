@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio
 from torch.utils.data import Dataset
 
 
@@ -27,12 +28,28 @@ class ASVspoofDataset(Dataset):
         n_fft: int = 512,
         n_samples: Optional[int] = None,
         seed: int = 42,
+        feature_type: str = "lfcc",
+        n_mfcc: int = 60,
     ):
         self.root = Path(root)
         self.sample_rate = sample_rate
         self.max_length = max_length
         self.n_lfcc = n_lfcc
         self.n_fft = n_fft
+        self.feature_type = (feature_type or "lfcc").lower()
+        self.n_mfcc = int(n_mfcc)
+        hop = max(1, n_fft // 4)
+        n_mels = max(64, self.n_mfcc * 2)
+        self._mfcc_tfm = torchaudio.transforms.MFCC(
+            sample_rate=sample_rate,
+            n_mfcc=self.n_mfcc,
+            melkwargs={
+                "n_fft": n_fft,
+                "hop_length": hop,
+                "n_mels": n_mels,
+                "center": False,
+            },
+        )
 
         self.samples: List[Dict] = []
         self._load_protocol(split)
@@ -154,14 +171,35 @@ class ASVspoofDataset(Dataset):
         lfcc = torch.matmul(dct_matrix, log_energy)
         return lfcc.unsqueeze(0)  # (1, n_lfcc, time)
 
+    def _extract_mfcc(self, waveform: torch.Tensor) -> torch.Tensor:
+        """MFCC spectrogram (Mel filterbank + log + DCT) via torchaudio."""
+        w = waveform.squeeze(0)
+        mfcc = self._mfcc_tfm(w)
+        return mfcc.unsqueeze(0)
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         sample = self.samples[idx]
         waveform = self._load_audio(sample["path"])
-        lfcc = self._extract_lfcc(waveform)
-        return lfcc, sample["label"]
+        if self.feature_type == "mfcc":
+            feat = self._extract_mfcc(waveform)
+        else:
+            feat = self._extract_lfcc(waveform)
+        return feat, sample["label"]
+
+
+def asvspoof_kwargs_from_config(audio_cfg: dict) -> dict:
+    """Keyword args for :class:`ASVspoofDataset` from ``data_config.yaml`` ``asvspoof2019.audio``."""
+    return {
+        "sample_rate": audio_cfg["sample_rate"],
+        "max_length": audio_cfg["max_length"],
+        "n_lfcc": audio_cfg["n_lfcc"],
+        "n_fft": audio_cfg["n_fft"],
+        "feature_type": audio_cfg.get("feature_type", "lfcc"),
+        "n_mfcc": int(audio_cfg.get("n_mfcc", audio_cfg.get("n_lfcc", 60))),
+    }
 
 
 def build_asvspoof_datasets(
@@ -174,16 +212,14 @@ def build_asvspoof_datasets(
     seed = cfg["sampling"]["seed"]
     n = n_samples or cfg["sampling"]["n_per_dataset"]
 
+    ak = asvspoof_kwargs_from_config(audio_cfg)
     datasets = {}
     for split in ["train", "dev", "eval"]:
         datasets[split] = ASVspoofDataset(
             root=root,
             split=split,
-            sample_rate=audio_cfg["sample_rate"],
-            max_length=audio_cfg["max_length"],
-            n_lfcc=audio_cfg["n_lfcc"],
-            n_fft=audio_cfg["n_fft"],
             n_samples=n,
             seed=seed,
+            **ak,
         )
     return datasets

@@ -50,6 +50,7 @@ def train_audio(data_config_path: str, model_config: dict, output_dir: str = "ou
         optimizer, mode="min", factor=0.5, patience=5
     )
     criterion = torch.nn.CrossEntropyLoss()
+    use_amp = model_config.get("training", {}).get("use_amp", False)
 
     trainer = Trainer(
         model=model,
@@ -60,6 +61,7 @@ def train_audio(data_config_path: str, model_config: dict, output_dir: str = "ou
         device=device,
         output_dir=output_dir,
         scheduler=scheduler,
+        use_amp=use_amp,
     )
 
     return trainer.train(

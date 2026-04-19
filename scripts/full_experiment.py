@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Full experiment v2: all recommendations applied.
- - Visual: data augmentation, frozen ResNet layers, face detection, 200 samples, 60/20/20 splits
- - Audio: 200 samples, more epochs
- - Fusion: real embedding-based attention fusion (trained)
- - Label smoothing, stronger regularization
- - Comparison charts against v1 baseline
+Full experiment v3: oriented EER metrics, larger FF++ sampling, optional EfficientNet,
+optional MediaPipe face crops, optional K-fold visual evaluation, CLI overrides.
 """
 
+import argparse
 import json
 import sys
 import time
@@ -25,38 +22,67 @@ import numpy as np
 import seaborn as sns
 import torch
 import torch.nn as nn
+import yaml
 from sklearn.metrics import confusion_matrix, roc_curve
+from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.data.asvspoof_loader import ASVspoofDataset
-from src.data.ff_c23_loader import FF_C23_Dataset
+from src.data.asvspoof_loader import ASVspoofDataset, asvspoof_kwargs_from_config
+from src.data.ff_c23_loader import (
+    FF_C23_Dataset,
+    balanced_sample_pool,
+    load_ff_c23_metadata,
+    train_val_test_split_indices,
+)
 from src.data.sampling import load_data_config
-from src.evaluation.metrics import compute_all_metrics, compute_eer
+from src.evaluation.calibration import best_threshold_min_max_frr_far
+from src.evaluation.metrics import compute_all_metrics, metrics_to_jsonable, orient_scores_for_spoof
 from src.models.audio_backbone import AudioBackbone
-from src.models.fusion import build_fusion
-from src.models.visual_backbone import VisualBackbone
+from src.models.fusion import ContrastiveMetricFusion, build_fusion
+from src.models.visual_backbone import build_visual_backbone
 from src.training.trainer import Trainer
+from src.utils.torch_device import get_torch_device
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_DIR = Path("outputs/experiment_v2")
+
+# ── CONFIG (defaults; main() overrides via argparse) ─────────────────────────
+DEVICE = get_torch_device()
+OUTPUT_DIR = Path("outputs/experiment_v3")
 CHARTS_DIR = OUTPUT_DIR / "charts"
 RESULTS_DIR = OUTPUT_DIR / "results"
 
-N_SAMPLES = 200
-NUM_FRAMES = 4
+N_SAMPLES = 800
+NUM_FRAMES = None
 VISUAL_EPOCHS = 20
 AUDIO_EPOCHS = 20
 FUSION_EPOCHS = 30
 BATCH_SIZE = 8
 LR = 3e-4
 LABEL_SMOOTHING = 0.1
+VISUAL_BACKBONE = "resnet18"
+VISUAL_LABEL = "Visual (ResNet18)"
+FACE_DETECTOR = "haar"
+KFOLD = 0
+KFOLD_EPOCHS = 10
+MODEL_CONFIG_PATH = "config/model_config.yaml"
+USE_AMP = False
+FUSION_METHOD = "attention"
+FUSION_CONTRASTIVE_WEIGHT = 0.3
+# cross_dataset: legacy FF++ vs ASVspoof pairing + synthetic mismatches; ff_av: same FaceForensics++ clip
+PAIRED_SOURCE = "cross_dataset"
+
 
 plt.rcParams.update({
     "figure.dpi": 150, "savefig.dpi": 150, "font.size": 11,
     "axes.titlesize": 13, "axes.labelsize": 11, "figure.facecolor": "white",
 })
 sns.set_theme(style="whitegrid", palette="muted")
+
+
+def _num_frames_for_run() -> int:
+    data_cfg = load_data_config()
+    return NUM_FRAMES if NUM_FRAMES is not None else int(
+        data_cfg["ff_c23"]["frame_extraction"]["num_frames"]
+    )
 
 
 # ── AUDIO ────────────────────────────────────────────────────────────────────
@@ -69,31 +95,55 @@ def train_audio_model():
     root = data_cfg["paths"]["asvspoof2019"]
     acfg = data_cfg["asvspoof2019"]["audio"]
 
-    train_ds = ASVspoofDataset(root=root, split="train", sample_rate=acfg["sample_rate"],
-        max_length=acfg["max_length"], n_lfcc=acfg["n_lfcc"], n_fft=acfg["n_fft"],
-        n_samples=N_SAMPLES, seed=42)
-    dev_ds = ASVspoofDataset(root=root, split="dev", sample_rate=acfg["sample_rate"],
-        max_length=acfg["max_length"], n_lfcc=acfg["n_lfcc"], n_fft=acfg["n_fft"],
-        n_samples=N_SAMPLES, seed=42)
-    eval_ds = ASVspoofDataset(root=root, split="eval", sample_rate=acfg["sample_rate"],
-        max_length=acfg["max_length"], n_lfcc=acfg["n_lfcc"], n_fft=acfg["n_fft"],
-        n_samples=N_SAMPLES, seed=42)
+    n_eff = N_SAMPLES if N_SAMPLES and N_SAMPLES > 0 else None
+    ak = asvspoof_kwargs_from_config(acfg)
+    train_ds = ASVspoofDataset(
+        root=root,
+        split="train",
+        n_samples=n_eff,
+        seed=42,
+        **ak,
+    )
+    dev_ds = ASVspoofDataset(
+        root=root,
+        split="dev",
+        n_samples=n_eff,
+        seed=42,
+        **ak,
+    )
+    eval_ds = ASVspoofDataset(
+        root=root,
+        split="eval",
+        n_samples=n_eff,
+        seed=42,
+        **ak,
+    )
 
     print(f"  Train: {len(train_ds)} | Dev: {len(dev_ds)} | Eval: {len(eval_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+    )
     val_loader = DataLoader(dev_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     test_loader = DataLoader(eval_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     model = AudioBackbone(embedding_dim=512)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=AUDIO_EPOCHS)
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     out = OUTPUT_DIR / "audio"
-    trainer = Trainer(model=model, train_loader=train_loader, val_loader=val_loader,
-        optimizer=optimizer, criterion=criterion, device=DEVICE,
-        output_dir=str(out), scheduler=scheduler)
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=DEVICE,
+        output_dir=str(out),
+        scheduler=scheduler,
+        use_amp=USE_AMP,
+    )
 
     print(f"\nTraining {AUDIO_EPOCHS} epochs...")
     history = trainer.train(epochs=AUDIO_EPOCHS, patience=12)
@@ -112,49 +162,95 @@ def train_audio_model():
 # ── VISUAL ───────────────────────────────────────────────────────────────────
 def train_visual_model():
     print("\n" + "=" * 70)
-    print("  VISUAL BACKBONE — ResNet18 (frozen layers + augmentation)")
+    print(f"  VISUAL BACKBONE — {VISUAL_LABEL} (frozen layers + augmentation)")
     print("=" * 70)
 
     data_cfg = load_data_config()
     root = data_cfg["paths"]["ff_c23"]
     csv_dir = data_cfg["ff_c23"]["csv_dir"]
     face_size = data_cfg["ff_c23"]["frame_extraction"]["face_size"]
+    nf = _num_frames_for_run()
+    n_eff = N_SAMPLES if N_SAMPLES and N_SAMPLES > 0 else None
 
-    print(f"Loading data ({NUM_FRAMES} frames, face detection ON, augmentation ON)...")
-    train_ds = FF_C23_Dataset(root=root, csv_dir=csv_dir, split="train",
-        num_frames=NUM_FRAMES, face_size=face_size, n_samples=N_SAMPLES, seed=42,
-        use_face_detection=True)
-    val_ds = FF_C23_Dataset(root=root, csv_dir=csv_dir, split="val",
-        num_frames=NUM_FRAMES, face_size=face_size, n_samples=N_SAMPLES, seed=42,
-        use_face_detection=True)
-    test_ds = FF_C23_Dataset(root=root, csv_dir=csv_dir, split="test",
-        num_frames=NUM_FRAMES, face_size=face_size, n_samples=N_SAMPLES, seed=42,
-        use_face_detection=True)
+    print(
+        f"Loading data ({nf} frames, face detector={FACE_DETECTOR}, "
+        f"n_samples={n_eff or 'all'}, augmentation ON)..."
+    )
+    train_ds = FF_C23_Dataset(
+        root=root,
+        csv_dir=csv_dir,
+        split="train",
+        num_frames=nf,
+        face_size=face_size,
+        n_samples=n_eff,
+        seed=42,
+        use_face_detection=True,
+        face_detector=FACE_DETECTOR,
+    )
+    val_ds = FF_C23_Dataset(
+        root=root,
+        csv_dir=csv_dir,
+        split="val",
+        num_frames=nf,
+        face_size=face_size,
+        n_samples=n_eff,
+        seed=42,
+        use_face_detection=True,
+        face_detector=FACE_DETECTOR,
+    )
+    test_ds = FF_C23_Dataset(
+        root=root,
+        csv_dir=csv_dir,
+        split="test",
+        num_frames=nf,
+        face_size=face_size,
+        n_samples=n_eff,
+        seed=42,
+        use_face_detection=True,
+        face_detector=FACE_DETECTOR,
+    )
 
     print(f"  Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+    )
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    model = VisualBackbone(embedding_dim=512, pretrained=True,
-                           freeze_layers=6, dropout=0.5)
+    freeze_vis = 5 if VISUAL_BACKBONE == "efficientnet_b0" else 6
+    model = build_visual_backbone(
+        backbone=VISUAL_BACKBONE,
+        embedding_dim=512,
+        pretrained=True,
+        freeze_layers=freeze_vis,
+        dropout=0.5,
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {trainable:,} trainable / {total:,} total ({100*trainable/total:.1f}%)")
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=LR, weight_decay=1e-3,
+        lr=LR,
+        weight_decay=1e-3,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=VISUAL_EPOCHS)
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     out = OUTPUT_DIR / "visual"
-    trainer = Trainer(model=model, train_loader=train_loader, val_loader=val_loader,
-        optimizer=optimizer, criterion=criterion, device=DEVICE,
-        output_dir=str(out), scheduler=scheduler)
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=DEVICE,
+        output_dir=str(out),
+        scheduler=scheduler,
+        use_amp=USE_AMP,
+    )
 
     print(f"\nTraining {VISUAL_EPOCHS} epochs...")
     history = trainer.train(epochs=VISUAL_EPOCHS, patience=12)
@@ -166,20 +262,130 @@ def train_visual_model():
     test_scores, test_labels, test_preds = collect_predictions(model, test_loader)
     test_metrics = compute_all_metrics(test_labels, test_scores)
 
-    return {"history": history, "test_metrics": test_metrics,
-            "test_scores": test_scores, "test_labels": test_labels, "test_preds": test_preds,
-            "model": model, "test_loader": test_loader}
+    return {
+        "history": history,
+        "test_metrics": test_metrics,
+        "test_scores": test_scores,
+        "test_labels": test_labels,
+        "test_preds": test_preds,
+        "model": model,
+        "test_loader": test_loader,
+    }
 
 
 # ── FUSION (real embedding-based) ────────────────────────────────────────────
+@torch.no_grad()
+def _validate_fusion_contrastive(model, loader, criterion, cw: float):
+    model.eval()
+    all_scores, all_labels = [], []
+    total_loss = 0.0
+    n_batches = 0
+    for v_emb, a_emb, labels in loader:
+        v_emb, a_emb, labels = v_emb.to(DEVICE), a_emb.to(DEVICE), labels.to(DEVICE)
+        logits, dist = model(v_emb, a_emb)
+        loss = criterion(logits, labels) + cw * ContrastiveMetricFusion.contrastive_loss(dist, labels)
+        total_loss += float(loss.item())
+        n_batches += 1
+        probs = torch.softmax(logits.float(), dim=1)[:, 1]
+        all_scores.append(probs.cpu().numpy())
+        all_labels.append(labels.cpu().numpy())
+    all_scores = np.concatenate(all_scores)
+    all_labels = np.concatenate(all_labels)
+    metrics = compute_all_metrics(all_labels, all_scores)
+    metrics["loss"] = total_loss / max(n_batches, 1)
+    return metrics
+
+
+def _train_contrastive_fusion_loop(model, train_loader, val_loader, out_dir: Path, epochs: int, patience: int, cw: float):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    history = {"train_loss": [], "val_loss": [], "val_eer": [], "val_accuracy": [], "val_auc": []}
+    best_eer = 1.0
+    no_improve = 0
+    last_metrics: dict = {}
+    epoch = 0
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        tl = 0.0
+        nb = 0
+        for v_emb, a_emb, labels in train_loader:
+            v_emb, a_emb, labels = v_emb.to(DEVICE), a_emb.to(DEVICE), labels.to(DEVICE)
+            opt.zero_grad(set_to_none=True)
+            logits, dist = model(v_emb, a_emb)
+            loss = criterion(logits, labels) + cw * ContrastiveMetricFusion.contrastive_loss(dist, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            tl += float(loss.item())
+            nb += 1
+        train_loss = tl / max(nb, 1)
+        val_metrics = _validate_fusion_contrastive(model, val_loader, criterion, cw)
+        sched.step()
+        elapsed = time.time() - t0
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_metrics["loss"])
+        history["val_eer"].append(val_metrics["eer"])
+        history["val_accuracy"].append(val_metrics["accuracy"])
+        history["val_auc"].append(val_metrics["auc"])
+        fn = " [scores↔]" if val_metrics.get("scores_flipped") else ""
+        print(
+            f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
+            f"EER: {val_metrics['eer']:.4f} | AUC: {val_metrics['auc']:.4f} | Acc: {val_metrics['accuracy']:.4f}{fn} | "
+            f"{elapsed:.1f}s"
+        )
+        last_metrics = val_metrics
+        if val_metrics["eer"] < best_eer:
+            best_eer = val_metrics["eer"]
+            no_improve = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "metrics": val_metrics,
+                },
+                out_dir / "best_model.pt",
+            )
+        else:
+            no_improve += 1
+        if no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} (patience={patience})")
+            break
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "metrics": last_metrics,
+        },
+        out_dir / "last_model.pt",
+    )
+    return history
+
+
 def train_fusion_model(visual_results, audio_results):
+    fusion_method = (FUSION_METHOD or "attention").lower()
+    with open(MODEL_CONFIG_PATH) as f:
+        mcfg = yaml.safe_load(f)
+    fcw = float(mcfg.get("fusion", {}).get("contrastive_weight", FUSION_CONTRASTIVE_WEIGHT))
+    if fusion_method not in ("concat", "attention", "contrastive"):
+        fusion_method = "attention"
+
     print("\n" + "=" * 70)
-    print("  FUSION — Attention + Embedding-based Training")
+    paired = (PAIRED_SOURCE or "cross_dataset").lower()
+    print(f"  FUSION — {fusion_method} + embedding-based training | pairing={paired}")
     print("=" * 70)
 
     # --- Load pre-trained backbones ---
-    visual_model = VisualBackbone(embedding_dim=512, pretrained=False,
-                                  freeze_layers=0, dropout=0.5)
+    visual_model = build_visual_backbone(
+        backbone=VISUAL_BACKBONE,
+        embedding_dim=512,
+        pretrained=False,
+        freeze_layers=0,
+        dropout=0.5,
+    )
     v_ckpt = torch.load(OUTPUT_DIR / "visual" / "best_model.pt",
                          map_location=DEVICE, weights_only=False)
     visual_model.load_state_dict(v_ckpt["model_state_dict"])
@@ -193,45 +399,112 @@ def train_fusion_model(visual_results, audio_results):
 
     # --- Extract real embeddings ---
     data_cfg = load_data_config()
-    root_a = data_cfg["paths"]["asvspoof2019"]
     acfg = data_cfg["asvspoof2019"]["audio"]
     root_v = data_cfg["paths"]["ff_c23"]
     csv_dir = data_cfg["ff_c23"]["csv_dir"]
     face_size = data_cfg["ff_c23"]["frame_extraction"]["face_size"]
 
-    print("  Extracting visual embeddings...")
-    v_train_ds = FF_C23_Dataset(root=root_v, csv_dir=csv_dir, split="train",
-        num_frames=NUM_FRAMES, face_size=face_size, n_samples=N_SAMPLES, seed=42,
-        use_face_detection=True)
-    v_test_ds = FF_C23_Dataset(root=root_v, csv_dir=csv_dir, split="test",
-        num_frames=NUM_FRAMES, face_size=face_size, n_samples=N_SAMPLES, seed=42,
-        use_face_detection=True)
+    nf = _num_frames_for_run()
+    n_eff = N_SAMPLES if N_SAMPLES and N_SAMPLES > 0 else None
 
-    v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, num_workers=0)
-    v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+    if paired == "ff_av":
+        print("  Same-clip pairing: extracting audio from each FF++ video (requires ffmpeg if torchaudio cannot decode).")
+        v_train_ds = FF_C23_Dataset(
+            root=root_v,
+            csv_dir=csv_dir,
+            split="train",
+            num_frames=nf,
+            face_size=face_size,
+            n_samples=n_eff,
+            seed=42,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+            include_audio=True,
+            audio_cfg=acfg,
+        )
+        v_test_ds = FF_C23_Dataset(
+            root=root_v,
+            csv_dir=csv_dir,
+            split="test",
+            num_frames=nf,
+            face_size=face_size,
+            n_samples=n_eff,
+            seed=42,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+            include_audio=True,
+            audio_cfg=acfg,
+        )
+        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, num_workers=0)
+        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+        print("  Extracting paired visual + audio embeddings (FaceForensics++ clips)...")
+        train_v_emb, train_a_emb, train_labels = extract_paired_av_embeddings(
+            visual_model, audio_model, v_train_loader
+        )
+        test_v_emb, test_a_emb, test_labels = extract_paired_av_embeddings(
+            visual_model, audio_model, v_test_loader
+        )
+    else:
+        print("  Extracting visual embeddings...")
+        v_train_ds = FF_C23_Dataset(
+            root=root_v,
+            csv_dir=csv_dir,
+            split="train",
+            num_frames=nf,
+            face_size=face_size,
+            n_samples=n_eff,
+            seed=42,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+        )
+        v_test_ds = FF_C23_Dataset(
+            root=root_v,
+            csv_dir=csv_dir,
+            split="test",
+            num_frames=nf,
+            face_size=face_size,
+            n_samples=n_eff,
+            seed=42,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+        )
 
-    v_train_emb, v_train_lbl = extract_embeddings(visual_model, v_train_loader)
-    v_test_emb, v_test_lbl = extract_embeddings(visual_model, v_test_loader)
+        v_train_loader = DataLoader(v_train_ds, batch_size=BATCH_SIZE, num_workers=0)
+        v_test_loader = DataLoader(v_test_ds, batch_size=BATCH_SIZE, num_workers=0)
 
-    print("  Extracting audio embeddings...")
-    a_train_ds = ASVspoofDataset(root=root_a, split="train", sample_rate=acfg["sample_rate"],
-        max_length=acfg["max_length"], n_lfcc=acfg["n_lfcc"], n_fft=acfg["n_fft"],
-        n_samples=N_SAMPLES, seed=42)
-    a_test_ds = ASVspoofDataset(root=root_a, split="eval", sample_rate=acfg["sample_rate"],
-        max_length=acfg["max_length"], n_lfcc=acfg["n_lfcc"], n_fft=acfg["n_fft"],
-        n_samples=N_SAMPLES, seed=42)
+        v_train_emb, v_train_lbl = extract_embeddings(visual_model, v_train_loader)
+        v_test_emb, v_test_lbl = extract_embeddings(visual_model, v_test_loader)
 
-    a_train_loader = DataLoader(a_train_ds, batch_size=BATCH_SIZE, num_workers=0)
-    a_test_loader = DataLoader(a_test_ds, batch_size=BATCH_SIZE, num_workers=0)
+        print("  Extracting audio embeddings (ASVspoof)...")
+        root_a = data_cfg["paths"]["asvspoof2019"]
+        ak = asvspoof_kwargs_from_config(acfg)
+        a_train_ds = ASVspoofDataset(
+            root=root_a,
+            split="train",
+            n_samples=n_eff,
+            seed=42,
+            **ak,
+        )
+        a_test_ds = ASVspoofDataset(
+            root=root_a,
+            split="eval",
+            n_samples=n_eff,
+            seed=42,
+            **ak,
+        )
 
-    a_train_emb, a_train_lbl = extract_embeddings(audio_model, a_train_loader)
-    a_test_emb, a_test_lbl = extract_embeddings(audio_model, a_test_loader)
+        a_train_loader = DataLoader(a_train_ds, batch_size=BATCH_SIZE, num_workers=0)
+        a_test_loader = DataLoader(a_test_ds, batch_size=BATCH_SIZE, num_workers=0)
 
-    # --- Build paired training data ---
-    train_v_emb, train_a_emb, train_labels = build_pairs(
-        v_train_emb, v_train_lbl, a_train_emb, a_train_lbl)
-    test_v_emb, test_a_emb, test_labels = build_pairs(
-        v_test_emb, v_test_lbl, a_test_emb, a_test_lbl)
+        a_train_emb, a_train_lbl = extract_embeddings(audio_model, a_train_loader)
+        a_test_emb, a_test_lbl = extract_embeddings(audio_model, a_test_loader)
+
+        train_v_emb, train_a_emb, train_labels = build_pairs(
+            v_train_emb, v_train_lbl, a_train_emb, a_train_lbl
+        )
+        test_v_emb, test_a_emb, test_labels = build_pairs(
+            v_test_emb, v_test_lbl, a_test_emb, a_test_lbl
+        )
 
     print(f"  Paired train: {len(train_labels)} | test: {len(test_labels)}")
 
@@ -245,31 +518,63 @@ def train_fusion_model(visual_results, audio_results):
         train_dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(42))
 
-    train_loader = DataLoader(train_sub, batch_size=16, shuffle=True)
+    train_loader = DataLoader(train_sub, batch_size=16, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_sub, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
-    # --- Train attention fusion ---
-    fusion_model = build_fusion("attention", visual_dim=512, audio_dim=512,
-                                hidden_dim=256, dropout=0.3)
-
-    def fusion_forward(model, batch, device):
-        v_emb, a_emb, labels = batch
-        v_emb, a_emb, labels = v_emb.to(device), a_emb.to(device), labels.to(device)
-        logits = model(v_emb, a_emb)
-        return logits, labels
-
-    optimizer = torch.optim.Adam(fusion_model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=FUSION_EPOCHS)
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    fcfg = mcfg.get("fusion", {})
+    hidden_dim = int(fcfg.get("hidden_dim", 256))
+    dropout = float(fcfg.get("dropout", 0.3))
 
     out = OUTPUT_DIR / "fusion"
-    trainer = Trainer(model=fusion_model, train_loader=train_loader, val_loader=val_loader,
-        optimizer=optimizer, criterion=criterion, device=DEVICE,
-        output_dir=str(out), scheduler=scheduler, forward_fn=fusion_forward)
+    out.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nTraining attention fusion for {FUSION_EPOCHS} epochs...")
-    fusion_history = trainer.train(epochs=FUSION_EPOCHS, patience=15)
+    if fusion_method == "contrastive":
+        fusion_model = build_fusion(
+            "contrastive",
+            visual_dim=512,
+            audio_dim=512,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        ).to(DEVICE)
+        print(f"\nTraining contrastive fusion (λ={fcw}) for {FUSION_EPOCHS} epochs...")
+        fusion_history = _train_contrastive_fusion_loop(
+            fusion_model, train_loader, val_loader, out, FUSION_EPOCHS, 15, fcw
+        )
+    else:
+        fusion_model = build_fusion(
+            fusion_method if fusion_method in ("concat", "attention") else "attention",
+            visual_dim=512,
+            audio_dim=512,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        )
+
+        def fusion_forward(model, batch, device):
+            v_emb, a_emb, labels = batch
+            v_emb, a_emb, labels = v_emb.to(device), a_emb.to(device), labels.to(device)
+            logits = model(v_emb, a_emb)
+            return logits, labels
+
+        optimizer = torch.optim.AdamW(fusion_model.parameters(), lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=FUSION_EPOCHS)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+        trainer = Trainer(
+            model=fusion_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=DEVICE,
+            output_dir=str(out),
+            scheduler=scheduler,
+            forward_fn=fusion_forward,
+            use_amp=USE_AMP,
+        )
+
+        print(f"\nTraining {fusion_method} fusion for {FUSION_EPOCHS} epochs...")
+        fusion_history = trainer.train(epochs=FUSION_EPOCHS, patience=15)
 
     # --- Evaluate fusion ---
     ckpt = torch.load(out / "best_model.pt", map_location=DEVICE, weights_only=False)
@@ -280,7 +585,8 @@ def train_fusion_model(visual_results, audio_results):
     with torch.no_grad():
         for v_emb, a_emb, labels in test_loader:
             v_emb, a_emb = v_emb.to(DEVICE), a_emb.to(DEVICE)
-            logits = fusion_model(v_emb, a_emb)
+            out = fusion_model(v_emb, a_emb)
+            logits = out[0] if isinstance(out, tuple) else out
             probs = torch.softmax(logits, dim=1)[:, 1]
             test_scores.append(probs.cpu().numpy())
             test_lbls.append(labels.numpy())
@@ -288,8 +594,8 @@ def train_fusion_model(visual_results, audio_results):
     test_scores = np.concatenate(test_scores)
     test_lbls = np.concatenate(test_lbls)
     test_metrics = compute_all_metrics(test_lbls, test_scores)
-    _, thresh = compute_eer(test_lbls, test_scores)
-    test_preds = (test_scores >= thresh).astype(int)
+    oriented_f, _, _ = orient_scores_for_spoof(test_lbls, test_scores)
+    test_preds = (oriented_f >= test_metrics["eer_threshold"]).astype(int)
 
     # --- Also compute late fusion for comparison ---
     v_sc = visual_results["test_scores"]
@@ -301,14 +607,14 @@ def train_fusion_model(visual_results, audio_results):
     best_w = 0.5
     for w in np.arange(0.0, 1.05, 0.1):
         fused = w * v_sc[:n] + (1 - w) * a_sc[:n]
-        lbl = np.array([visual_results["test_labels"][i % len(visual_results["test_labels"])] for i in range(n)])
+        lbl = np.asarray(visual_results["test_labels"])[:n]
         m = compute_all_metrics(lbl, fused)
         late_results[f"{w:.1f}"] = m
         if m["eer"] < best_late_eer:
             best_late_eer = m["eer"]
             best_w = w
 
-    print(f"\n  Attention Fusion EER: {test_metrics['eer']:.4f}, AUC: {test_metrics['auc']:.4f}")
+    print(f"\n  Fusion ({fusion_method}) EER: {test_metrics['eer']:.4f}, AUC: {test_metrics['auc']:.4f}")
     print(f"  Late Fusion best EER: {best_late_eer:.4f} (w_visual={best_w:.1f})")
 
     return {
@@ -336,9 +642,10 @@ def collect_predictions(model, loader):
         all_labels.append(labels.numpy())
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
-    _, thresh = compute_eer(labels, scores)
-    preds = (scores >= thresh).astype(int)
-    return scores, labels, preds
+    m = compute_all_metrics(labels, scores)
+    oriented, _, _ = orient_scores_for_spoof(labels, scores)
+    preds = (oriented >= m["eer_threshold"]).astype(int)
+    return oriented, labels, preds
 
 
 @torch.no_grad()
@@ -351,6 +658,27 @@ def extract_embeddings(model, loader):
         embs.append(emb.cpu())
         labels.append(lbl)
     return torch.cat(embs), torch.cat(labels)
+
+
+@torch.no_grad()
+def extract_paired_av_embeddings(visual_model, audio_model, loader):
+    """Visual + audio embeddings from the same batch (e.g. FF++ clip with ``include_audio``)."""
+    visual_model.eval()
+    audio_model.eval()
+    v_embs, a_embs, labels = [], [], []
+    for batch in loader:
+        if len(batch) == 3:
+            v_in, a_in, lbl = batch
+        else:
+            raise ValueError("Expected (video, audio, label) batches for paired AV extraction.")
+        v_in = v_in.to(DEVICE)
+        a_in = a_in.to(DEVICE)
+        v_e = visual_model.extract_features(v_in)
+        a_e = audio_model.extract_features(a_in)
+        v_embs.append(v_e.cpu())
+        a_embs.append(a_e.cpu())
+        labels.append(lbl)
+    return torch.cat(v_embs), torch.cat(a_embs), torch.cat(labels)
 
 
 def build_pairs(v_emb, v_lbl, a_emb, a_lbl):
@@ -399,7 +727,7 @@ def generate_charts(audio, visual, fusion):
     CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
     plot_training_curves(audio["history"], "Audio (LCNN)", CHARTS_DIR / "audio_training.png")
-    plot_training_curves(visual["history"], "Visual (ResNet18)", CHARTS_DIR / "visual_training.png")
+    plot_training_curves(visual["history"], VISUAL_LABEL, CHARTS_DIR / "visual_training.png")
     plot_training_curves(fusion["history"], "Attention Fusion", CHARTS_DIR / "fusion_training.png")
     plot_combined(audio["history"], visual["history"], CHARTS_DIR / "combined_training.png")
     plot_roc(audio, visual, fusion, CHARTS_DIR / "roc_curves.png")
@@ -462,7 +790,7 @@ def plot_roc(audio, visual, fusion, path):
     fig, ax = plt.subplots(figsize=(8, 8))
     for r, name, color, ls in [
         (audio, "Audio (LCNN)", "#2196F3", "-"),
-        (visual, "Visual (ResNet18)", "#F44336", "--"),
+        (visual, VISUAL_LABEL, "#F44336", "--"),
         (fusion, "Attention Fusion", "#4CAF50", "-."),
     ]:
         fpr, tpr, _ = roc_curve(r["test_labels"], r["test_scores"])
@@ -530,7 +858,7 @@ def plot_scores(audio, visual, path):
 
 def plot_eer(audio, visual, fusion, path):
     fig, ax = plt.subplots(figsize=(8, 6))
-    names = ["Audio\n(LCNN)", "Visual\n(ResNet18)", "Attention\nFusion"]
+    names = ["Audio\n(LCNN)", VISUAL_LABEL.replace(" ", "\n", 1), "Attention\nFusion"]
     eers = [r["test_metrics"]["eer"]*100 for r in [audio, visual, fusion]]
     colors = ["#2196F3", "#F44336", "#4CAF50"]
     bars = ax.bar(names, eers, color=colors, edgecolor="black", lw=0.5, width=0.5)
@@ -589,7 +917,7 @@ def plot_dashboard(audio, visual, fusion, path):
         ax.hist(rr["test_scores"][rr["test_labels"]==1], bins=20, alpha=0.4, color=c, histtype="step", lw=2, ls="--", label=f"{n} Spf")
     ax.set_title("Score Distributions"); ax.legend(fontsize=8)
 
-    fig.suptitle("Multi-Modal Liveness Detection — v2 Dashboard", fontsize=18, fontweight="bold", y=0.98)
+    fig.suptitle("Multi-Modal Liveness Detection — v3 Dashboard", fontsize=18, fontweight="bold", y=0.98)
     plt.savefig(path, bbox_inches="tight"); plt.close()
     print(f"  Saved: {path.name}")
 
@@ -626,13 +954,227 @@ def plot_v1_comparison(audio, visual, fusion, v1_path, path):
     print(f"  Saved: {path.name}")
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
+def run_visual_kfold():
+    """K-fold on train+val pool; reports mean ± std of best validation EER per fold."""
+    print("\n" + "=" * 70)
+    print(f"  VISUAL K-FOLD ({KFOLD} folds, {KFOLD_EPOCHS} epochs/fold)")
     print("=" * 70)
-    print("  MULTI-MODAL LIVENESS DETECTION — EXPERIMENT v2 (IMPROVED)")
-    print(f"  Device: {DEVICE} | Samples: {N_SAMPLES} | Frames: {NUM_FRAMES}")
-    print(f"  Improvements: augmentation, frozen layers, face detection,")
-    print(f"  attention fusion, label smoothing, cosine LR, more data")
+
+    data_cfg = load_data_config()
+    root = data_cfg["paths"]["ff_c23"]
+    csv_dir = data_cfg["ff_c23"]["csv_dir"]
+    face_size = data_cfg["ff_c23"]["frame_extraction"]["face_size"]
+    nf = _num_frames_for_run()
+    n_eff = N_SAMPLES if N_SAMPLES and N_SAMPLES > 0 else None
+
+    pool = balanced_sample_pool(
+        load_ff_c23_metadata(Path(root), Path(csv_dir)), n_eff, seed=42
+    )
+    if len(pool) < KFOLD * 8:
+        print(f"  Skipping K-fold: need at least {KFOLD * 8} samples, got {len(pool)}")
+        return None
+
+    train_idx, val_idx, _test_idx = train_val_test_split_indices(len(pool), 42, 0.6, 0.2)
+    tv_samples = [pool[i] for i in train_idx + val_idx]
+    if len(tv_samples) < KFOLD * 4:
+        print("  Skipping K-fold: train+val pool too small")
+        return None
+
+    kf = KFold(n_splits=KFOLD, shuffle=True, random_state=42)
+    fold_eers = []
+    for fold, (tr_i, va_i) in enumerate(kf.split(np.arange(len(tv_samples)))):
+        train_s = [tv_samples[j] for j in tr_i]
+        val_s = [tv_samples[j] for j in va_i]
+        train_ds = FF_C23_Dataset(
+            root=root,
+            csv_dir=csv_dir,
+            split="train",
+            explicit_samples=train_s,
+            num_frames=nf,
+            face_size=face_size,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+        )
+        val_ds = FF_C23_Dataset(
+            root=root,
+            csv_dir=csv_dir,
+            split="val",
+            explicit_samples=val_s,
+            num_frames=nf,
+            face_size=face_size,
+            use_face_detection=True,
+            face_detector=FACE_DETECTOR,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True
+        )
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+        freeze_vis = 5 if VISUAL_BACKBONE == "efficientnet_b0" else 6
+        model = build_visual_backbone(
+            backbone=VISUAL_BACKBONE,
+            embedding_dim=512,
+            pretrained=True,
+            freeze_layers=freeze_vis,
+            dropout=0.5,
+        )
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=LR,
+            weight_decay=1e-3,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=KFOLD_EPOCHS)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        out = OUTPUT_DIR / "visual_kfold" / f"fold_{fold}"
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=DEVICE,
+            output_dir=str(out),
+            scheduler=scheduler,
+            use_amp=USE_AMP,
+        )
+        trainer.train(epochs=KFOLD_EPOCHS, patience=5)
+        best_eer = min(trainer.history["val_eer"])
+        fold_eers.append(best_eer)
+        print(f"  Fold {fold + 1}/{KFOLD}: best val EER = {best_eer:.4f}")
+
+    mean_eer = float(np.mean(fold_eers))
+    std_eer = float(np.std(fold_eers))
+    print(f"\n  K-fold val EER: {mean_eer:.4f} ± {std_eer:.4f}")
+    return {"k": KFOLD, "epochs_per_fold": KFOLD_EPOCHS, "fold_best_val_eers": fold_eers,
+            "mean_best_val_eer": mean_eer, "std_best_val_eer": std_eer}
+
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Full multi-modal liveness experiment (v3)")
+    p.add_argument("--output-dir", default="outputs/experiment_v3", type=str)
+    p.add_argument(
+        "--n-samples",
+        type=int,
+        default=800,
+        help="Per-modality cap (balanced). Use 0 for full available pool.",
+    )
+    p.add_argument("--num-frames", type=int, default=None, help="Override config num_frames")
+    p.add_argument(
+        "--visual-backbone",
+        choices=["resnet18", "resnet34", "efficientnet_b0"],
+        default=None,
+        help="Default: config/model_config.yaml visual.backbone",
+    )
+    p.add_argument("--face-detector", choices=["haar", "mediapipe"], default="haar")
+    p.add_argument("--model-config", default="config/model_config.yaml")
+    p.add_argument("--kfold", type=int, default=0, help="If >0, run visual K-fold after main train")
+    p.add_argument("--kfold-epochs", type=int, default=10)
+    p.add_argument("--visual-epochs", type=int, default=None)
+    p.add_argument("--audio-epochs", type=int, default=None)
+    p.add_argument("--fusion-epochs", type=int, default=None)
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable CUDA automatic mixed precision (no-op on CPU)",
+    )
+    p.add_argument(
+        "--preset",
+        choices=["none", "strong", "production"],
+        default="none",
+        help="strong: full pool + MediaPipe + mild label smoothing + 12 frames if omitted; "
+        "production: same + 50 epochs/modality if epochs not set (long FF++ run; use GPU + --amp on CUDA)",
+    )
+    p.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=None,
+        help="Override CrossEntropy label smoothing (default module constant or preset)",
+    )
+    p.add_argument(
+        "--fusion-method",
+        choices=["attention", "contrastive", "concat"],
+        default=None,
+        help="Override config/model_config.yaml fusion.method",
+    )
+    p.add_argument(
+        "--paired-source",
+        choices=["cross_dataset", "ff_av"],
+        default=None,
+        help="Fusion embedding pairing: cross_dataset (FF++ vs ASVspoof + synthetic mismatches) or "
+        "ff_av (same FaceForensics++ clip: face + soundtrack). Default: model_config fusion.paired_source",
+    )
+    return p.parse_args()
+
+
+def main():
+    global OUTPUT_DIR, CHARTS_DIR, RESULTS_DIR, N_SAMPLES, NUM_FRAMES
+    global VISUAL_BACKBONE, VISUAL_LABEL, FACE_DETECTOR, KFOLD, KFOLD_EPOCHS
+    global VISUAL_EPOCHS, AUDIO_EPOCHS, FUSION_EPOCHS, MODEL_CONFIG_PATH, USE_AMP, LABEL_SMOOTHING
+    global FUSION_METHOD, FUSION_CONTRASTIVE_WEIGHT, PAIRED_SOURCE
+
+    args = parse_args()
+    num_frames_arg = args.num_frames
+    OUTPUT_DIR = Path(args.output_dir)
+    CHARTS_DIR = OUTPUT_DIR / "charts"
+    RESULTS_DIR = OUTPUT_DIR / "results"
+    N_SAMPLES = None if args.n_samples == 0 else args.n_samples
+    NUM_FRAMES = num_frames_arg
+    FACE_DETECTOR = args.face_detector
+    KFOLD = args.kfold
+    KFOLD_EPOCHS = args.kfold_epochs
+    MODEL_CONFIG_PATH = args.model_config
+
+    with open(MODEL_CONFIG_PATH) as f:
+        mcfg = yaml.safe_load(f)
+    vb = (args.visual_backbone or mcfg.get("visual", {}).get("backbone", "resnet18")).lower()
+    VISUAL_BACKBONE = vb.replace("-", "_")
+    if VISUAL_BACKBONE == "efficientnet_b0":
+        VISUAL_LABEL = "Visual (EfficientNet-B0)"
+    elif VISUAL_BACKBONE == "resnet34":
+        VISUAL_LABEL = "Visual (ResNet34)"
+    else:
+        VISUAL_LABEL = "Visual (ResNet18)"
+    FUSION_METHOD = args.fusion_method or mcfg.get("fusion", {}).get("method", "attention")
+    FUSION_CONTRASTIVE_WEIGHT = float(mcfg.get("fusion", {}).get("contrastive_weight", 0.3))
+    PAIRED_SOURCE = args.paired_source or mcfg.get("fusion", {}).get("paired_source", "cross_dataset")
+    if args.visual_epochs:
+        VISUAL_EPOCHS = args.visual_epochs
+    if args.audio_epochs:
+        AUDIO_EPOCHS = args.audio_epochs
+    if args.fusion_epochs:
+        FUSION_EPOCHS = args.fusion_epochs
+    USE_AMP = bool(args.amp)
+
+    preset = args.preset
+    if preset == "strong":
+        N_SAMPLES = None
+        FACE_DETECTOR = "mediapipe"
+        LABEL_SMOOTHING = 0.05
+        if num_frames_arg is None:
+            NUM_FRAMES = 12
+    elif preset == "production":
+        N_SAMPLES = None
+        FACE_DETECTOR = "mediapipe"
+        LABEL_SMOOTHING = 0.05
+        if num_frames_arg is None:
+            NUM_FRAMES = 12
+        if args.visual_epochs is None:
+            VISUAL_EPOCHS = 50
+        if args.audio_epochs is None:
+            AUDIO_EPOCHS = 50
+        if args.fusion_epochs is None:
+            FUSION_EPOCHS = 50
+    if args.label_smoothing is not None:
+        LABEL_SMOOTHING = float(args.label_smoothing)
+
+    print("=" * 70)
+    print("  MULTI-MODAL LIVENESS DETECTION — EXPERIMENT v3")
+    print(f"  Device: {DEVICE} | n_samples={N_SAMPLES or 'all'} | frames={_num_frames_for_run()}")
+    print(
+        f"  Visual: {VISUAL_BACKBONE} | face_detector={FACE_DETECTOR} | "
+        f"label_smoothing={LABEL_SMOOTHING} | preset={preset} | fusion_pairing={PAIRED_SOURCE} | AMP={USE_AMP}"
+    )
     print("=" * 70)
 
     for d in [OUTPUT_DIR, CHARTS_DIR, RESULTS_DIR]:
@@ -650,7 +1192,12 @@ def main():
     visual_time = time.time() - t0
     print(f"\n  Visual done in {visual_time:.1f}s")
 
-    # Remove model ref before passing (not serializable to JSON)
+    kfold_summary = None
+    if KFOLD > 0:
+        t0 = time.time()
+        kfold_summary = run_visual_kfold()
+        print(f"\n  K-fold done in {time.time() - t0:.1f}s")
+
     vis_for_fusion = {k: v for k, v in visual_results.items() if k not in ("model", "test_loader")}
 
     t0 = time.time()
@@ -662,26 +1209,55 @@ def main():
 
     total_time = time.time() - start
 
+    _dc = load_data_config()
+    _ac = _dc["asvspoof2019"]["audio"]
     summary = {
-        "experiment": {"device": str(DEVICE), "n_samples": N_SAMPLES,
-            "visual_epochs": VISUAL_EPOCHS, "audio_epochs": AUDIO_EPOCHS,
-            "fusion_epochs": FUSION_EPOCHS, "total_time": round(total_time, 1),
-            "improvements": ["augmentation", "frozen_layers", "face_detection",
-                           "attention_fusion", "label_smoothing", "cosine_lr",
-                           "balanced_sampling", "200_samples"]},
-        "audio_test_metrics": {k: round(float(v), 6) for k, v in audio_results["test_metrics"].items()},
-        "visual_test_metrics": {k: round(float(v), 6) for k, v in visual_results["test_metrics"].items()},
-        "fusion_test_metrics": {k: round(float(v), 6) for k, v in fusion_results["test_metrics"].items()},
+        "experiment": {
+            "device": str(DEVICE),
+            "n_samples": N_SAMPLES,
+            "num_frames": _num_frames_for_run(),
+            "visual_backbone": VISUAL_BACKBONE,
+            "audio_feature": _ac.get("feature_type", "lfcc"),
+            "fusion_method": FUSION_METHOD,
+            "fusion_contrastive_weight": FUSION_CONTRASTIVE_WEIGHT,
+            "paired_source": PAIRED_SOURCE,
+            "face_detector": FACE_DETECTOR,
+            "label_smoothing": LABEL_SMOOTHING,
+            "preset": preset,
+            "visual_epochs": VISUAL_EPOCHS,
+            "audio_epochs": AUDIO_EPOCHS,
+            "fusion_epochs": FUSION_EPOCHS,
+            "total_time": round(total_time, 1),
+            "oriented_eer_metrics": True,
+            "use_amp": USE_AMP,
+        },
+        "audio_test_metrics": metrics_to_jsonable(audio_results["test_metrics"]),
+        "visual_test_metrics": metrics_to_jsonable(visual_results["test_metrics"]),
+        "fusion_test_metrics": metrics_to_jsonable(fusion_results["test_metrics"]),
     }
+    if kfold_summary:
+        summary["visual_kfold"] = kfold_summary
+
+    thr_opt = {}
+    for name, res in (
+        ("audio", audio_results),
+        ("visual", visual_results),
+        ("fusion", fusion_results),
+    ):
+        row = best_threshold_min_max_frr_far(res["test_labels"], res["test_scores"])
+        if row:
+            thr_opt[name] = row
+    if thr_opt:
+        summary["threshold_minmax_frr_far"] = thr_opt
 
     with open(RESULTS_DIR / "experiment_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\n" + "=" * 70)
-    print("  FINAL RESULTS (v2)")
+    print("  FINAL RESULTS (v3)")
     print("=" * 70)
-    print(f"\n{'Metric':<20} {'Audio (LCNN)':<18} {'Visual (ResNet18)':<20} {'Att. Fusion':<18}")
-    print("-" * 76)
+    print(f"\n{'Metric':<20} {'Audio (LCNN)':<18} {VISUAL_LABEL:<22} {'Att. Fusion':<18}")
+    print("-" * 80)
     for metric in ["eer", "accuracy", "auc", "min_tdcf"]:
         a = audio_results["test_metrics"][metric]
         v = visual_results["test_metrics"][metric]
@@ -690,7 +1266,7 @@ def main():
             a_s, v_s, f_s = f"{a:.2%}", f"{v:.2%}", f"{f_val:.2%}"
         else:
             a_s, v_s, f_s = f"{a:.4f}", f"{v:.4f}", f"{f_val:.4f}"
-        print(f"{metric.upper():<20} {a_s:<18} {v_s:<20} {f_s:<18}")
+        print(f"{metric.upper():<20} {a_s:<18} {v_s:<22} {f_s:<18}")
 
     print(f"\nTotal time: {total_time:.1f}s")
     print(f"Charts: {CHARTS_DIR}/")

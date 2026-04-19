@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from .audio_backbone import AudioBackbone
 from .fusion import build_fusion
-from .visual_backbone import VisualBackbone
+from .visual_backbone import build_visual_backbone
 
 
 class MultiModalLivenessDetector(nn.Module):
@@ -28,9 +28,11 @@ class MultiModalLivenessDetector(nn.Module):
         fusion_dropout: float = 0.3,
         pretrained_visual: bool = True,
         num_classes: int = 2,
+        visual_backbone: str = "resnet18",
     ):
         super().__init__()
-        self.visual_backbone = VisualBackbone(
+        self.visual_backbone = build_visual_backbone(
+            backbone=visual_backbone,
             embedding_dim=visual_embedding_dim,
             pretrained=pretrained_visual,
             num_classes=num_classes,

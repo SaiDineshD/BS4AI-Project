@@ -10,6 +10,9 @@ data/LA/
 data/processed/
 data/sampling/
 data/raw/
+data/fairface-img-margin125-trainval/
+data/fairface-img-margin125-trainval.zip
+**/fairface_label_train.csv
 
 # Outputs
 outputs/

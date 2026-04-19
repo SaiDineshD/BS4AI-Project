@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.data.ff_c23_loader import build_ff_c23_datasets
 from src.data.sampling import load_data_config
-from src.models.visual_backbone import VisualBackbone
+from src.models.visual_backbone import build_visual_backbone
 from src.training.trainer import Trainer
 
 
@@ -37,9 +37,12 @@ def train_visual(data_config_path: str, model_config: dict, output_dir: str = "o
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = VisualBackbone(
+    vb = model_config.get("visual", {}).get("backbone", "resnet18")
+    model = build_visual_backbone(
+        backbone=vb,
         embedding_dim=model_config["visual"]["embedding_dim"],
         pretrained=model_config["visual"]["pretrained"],
+        freeze_layers=model_config["visual"].get("freeze_layers", 0),
     )
 
     optimizer = torch.optim.Adam(
@@ -51,6 +54,7 @@ def train_visual(data_config_path: str, model_config: dict, output_dir: str = "o
         optimizer, mode="min", factor=0.5, patience=5
     )
     criterion = torch.nn.CrossEntropyLoss()
+    use_amp = model_config.get("training", {}).get("use_amp", False)
 
     trainer = Trainer(
         model=model,
@@ -61,6 +65,7 @@ def train_visual(data_config_path: str, model_config: dict, output_dir: str = "o
         device=device,
         output_dir=output_dir,
         scheduler=scheduler,
+        use_amp=use_amp,
     )
 
     return trainer.train(

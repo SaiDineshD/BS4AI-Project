@@ -2,7 +2,7 @@
 # 200 samples from each dataset
 
 sampling:
-  n_per_dataset: 200
+  n_per_dataset: 400
   seed: 42
 
 paths:
@@ -10,6 +10,17 @@ paths:
   asvspoof2019: "data/LA/LA"
   processed: "data/processed"
   sampling_indices: "data/sampling"
+  # FairFace: images (e.g. fairface-img-margin125-trainval) + fairface_label_train.csv in same root
+  fairface: "data/fairface-img-margin125-trainval"
+
+fairface:
+  train_csv: "fairface_label_train.csv"
+  img_path_column: "file"
+  race_column: "race"
+  gender_column: "gender"
+  age_column: "age"
+  max_samples: 4000
+  face_size: 224
 
 ff_c23:
   compression: "c23"
@@ -41,7 +52,9 @@ asvspoof2019:
       protocol: "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.eval.trl.txt"
   audio:
     sample_rate: 16000
-    feature: "lfcc"
+    feature: "lfcc"           # legacy label; see feature_type
+    feature_type: "mfcc"       # lfcc | mfcc (MFCC per proposal; LFCC ASVspoof-style alternative)
     n_fft: 512
     n_lfcc: 60
+    n_mfcc: 60
     max_length: 64000  # 4 seconds at 16kHz

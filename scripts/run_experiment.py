@@ -27,9 +27,10 @@ from torch.utils.data import DataLoader
 from src.data.asvspoof_loader import build_asvspoof_datasets
 from src.data.ff_c23_loader import build_ff_c23_datasets
 from src.data.sampling import load_data_config
-from src.evaluation.metrics import compute_all_metrics
+from src.evaluation.metrics import compute_all_metrics, metrics_to_jsonable
 from src.training.train_audio import train_audio
 from src.training.train_visual import train_visual
+from src.utils.torch_device import get_torch_device
 
 
 def load_model_config(path: str = "config/model_config.yaml") -> dict:
@@ -74,9 +75,16 @@ def run_visual(data_config_path, model_config, output_dir):
     datasets = build_ff_c23_datasets(data_cfg)
     test_loader = DataLoader(datasets["test"], batch_size=model_config["training"]["batch_size"])
 
-    from src.models.visual_backbone import VisualBackbone
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VisualBackbone(embedding_dim=model_config["visual"]["embedding_dim"])
+    from src.models.visual_backbone import build_visual_backbone
+
+    device = get_torch_device()
+    vb = model_config.get("visual", {}).get("backbone", "resnet18")
+    model = build_visual_backbone(
+        backbone=vb,
+        embedding_dim=model_config["visual"]["embedding_dim"],
+        pretrained=model_config["visual"]["pretrained"],
+        freeze_layers=model_config["visual"].get("freeze_layers", 0),
+    )
     ckpt = torch.load(output_dir / "visual" / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
@@ -84,10 +92,13 @@ def run_visual(data_config_path, model_config, output_dir):
     test_metrics = evaluate_model(model, test_loader, device)
     print(f"\nVisual Test Results:")
     for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
     with open(output_dir / "visual" / "test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+        json.dump(metrics_to_jsonable(test_metrics), f, indent=2)
 
     return history, test_metrics
 
@@ -105,7 +116,7 @@ def run_audio(data_config_path, model_config, output_dir):
     test_loader = DataLoader(datasets["eval"], batch_size=model_config["training"]["batch_size"])
 
     from src.models.audio_backbone import AudioBackbone
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_torch_device()
     model = AudioBackbone(embedding_dim=model_config["audio"]["embedding_dim"])
     ckpt = torch.load(output_dir / "audio" / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -114,10 +125,13 @@ def run_audio(data_config_path, model_config, output_dir):
     test_metrics = evaluate_model(model, test_loader, device)
     print(f"\nAudio Test Results:")
     for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
     with open(output_dir / "audio" / "test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+        json.dump(metrics_to_jsonable(test_metrics), f, indent=2)
 
     return history, test_metrics
 
@@ -165,9 +179,16 @@ def main():
         "--mode", default="all", choices=["visual", "audio", "fusion", "all"],
         help="Which component to train",
     )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable CUDA AMP for training (Trainer; no-op on CPU)",
+    )
     args = parser.parse_args()
 
     model_config = load_model_config(args.model_config)
+    if args.amp:
+        model_config.setdefault("training", {})["use_amp"] = True
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,7 +197,7 @@ def main():
     print(f"Model config: {args.model_config}")
     print(f"Output dir: {output_dir}")
     print(f"Mode: {args.mode}")
-    print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"Device: {get_torch_device()}")
 
     start = time.time()
     results = {}
@@ -208,7 +229,10 @@ def main():
         for comp, metrics in summary.items():
             print(f"\n{comp.upper()}:")
             for k, v in metrics.items():
-                print(f"  {k}: {v:.4f}")
+                if isinstance(v, float):
+                    print(f"  {k}: {v:.4f}")
+                else:
+                    print(f"  {k}: {v}")
 
         with open(output_dir / "experiment_summary.json", "w") as f:
             json.dump(summary, f, indent=2)
